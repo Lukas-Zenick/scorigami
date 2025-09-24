@@ -12,7 +12,7 @@ These instructions will get you a copy of the project up and running on your loc
 
 You will need [Node.js](https://nodejs.org/en/) and [npm](https://www.npmjs.com/).
 
-You will also need a PostgreSQL server in order to run and develop for the server. For information on how to set up a server, see [this tutorial](https://www.techrepublic.com/blog/diy-it-guy/diy-a-postgresql-database-server-setup-anyone-can-handle/). After setting up the server, be sure to create a database on that server (the tutorial has instructions for that as well).
+**No database server installation required!** This project now uses SQLite, which creates a local database file automatically.
 
 ### Installing
 
@@ -26,12 +26,7 @@ cd scorigami
 npm install
 ```
 
-go to /js/Node/dbVars.js and change DATABASE_URL to your database URL. You may also change ADD_DEBUG_TABLES, but it is recommended you keep it true unless you have limited space. 
-
-```
-var DATABASE_URL = "postgres://{{USERNAME}}:{{PASSWORD}}@{{SERVER HOST}}:{{PORT}}/{{DATABASE NAME}}";
-var ADD_DEBUG_TABLES = true; //creates a second set of tables, identical to the first set that can be used for testing
-```
+The database is now automatically configured to use SQLite. No manual configuration needed! The database file `scorigami.db` will be created automatically in the project root when you run the setup script.
 
 Populate your database, luckily, I have written a script to do this for you
 

@@ -3,7 +3,7 @@
 var express = require("express");
 var app = express();
 var path = require("path");
-const { Client } = require("pg");
+var sqlite3 = require("sqlite3").verbose();
 require("dotenv").load();
 var request = require("request");
 var teamParser = require("./teamParser.js");
@@ -33,24 +33,43 @@ if(process.env.DEBUG)
 	metadataTable = "metadata_DEBUG";
 }
 
-var DATABASE_URL = process.env.DATABASE_URL;
-var ssl = {rejectUnauthorized: false};
-if(!DATABASE_URL)
-{
-	DATABASE_URL = dbVars.DATABASE_URL;
-	ssl = {rejectUnauthorized: false};
-}
+// Use environment database path if available, otherwise use local SQLite file
+var databasePath = process.env.DATABASE_PATH || dbVars.DATABASE_PATH;
 
-const client = new Client({
-	connectionString: DATABASE_URL,
-	ssl: ssl,
-	//statement_timeout: 5000,
-	//query_timeout: 5000,
-	//connectionTimeoutMillis: 5000,
-	//idle_in_transaction_session_timeout: 5000,
+const db = new sqlite3.Database(databasePath, (err) => {
+	if (err) {
+		console.error('Error opening database:', err.message);
+	} else {
+		console.log('Connected to SQLite database at:', databasePath);
+		// Enable foreign keys
+		db.run("PRAGMA foreign_keys = ON");
+	}
 });
 
-client.connect();
+// Helper function to promisify SQLite operations
+function dbQuery(sql, params = []) {
+	return new Promise((resolve, reject) => {
+		db.all(sql, params, (err, rows) => {
+			if (err) {
+				reject(err);
+			} else {
+				resolve({ rows: rows });
+			}
+		});
+	});
+}
+
+function dbRun(sql, params = []) {
+	return new Promise((resolve, reject) => {
+		db.run(sql, params, function(err) {
+			if (err) {
+				reject(err);
+			} else {
+				resolve({ changes: this.changes, lastID: this.lastID });
+			}
+		});
+	});
+}
 
 app.use(express.static(__dirname + "/../.."));
 
@@ -86,7 +105,7 @@ function updateData()
 			if (data.season && (data.season.type === 2 || data.season.type === 3))
 			{
 				//check the current week
-				client.query("SELECT data_int FROM " + metadataTable + " WHERE description='current_week';")
+				dbQuery("SELECT data_int FROM " + metadataTable + " WHERE description='current_week'")
 					.then(res1 =>
 					{
 						var current_week = res1.rows[0].data_int;
@@ -94,8 +113,12 @@ function updateData()
 						if(data.week && current_week !== data.week.number)
 						{
 							console.log(data);
-							client.query("UPDATE " + metadataTable + " SET data_int=" + data.week.number + " WHERE description='current_week';DELETE FROM " + metadataTable + " WHERE description='tracked_game';")
-								.then(res2 => 
+							// SQLite requires separate queries
+							dbRun("UPDATE " + metadataTable + " SET data_int=" + data.week.number + " WHERE description='current_week'")
+								.then(res2 => {
+									return dbRun("DELETE FROM " + metadataTable + " WHERE description='tracked_game'");
+								})
+								.then(res3 => 
 								{
 									newScorigami = [];
 									updateData();
@@ -105,7 +128,7 @@ function updateData()
 						else
 						{
 							//get the list of tracked games
-							client.query("SELECT data_int, data_text FROM " + metadataTable + " WHERE description='tracked_game';")
+							dbQuery("SELECT data_int, data_text FROM " + metadataTable + " WHERE description='tracked_game'")
 								.then (res2 =>
 							{	
 								var newgames = [];
@@ -158,7 +181,7 @@ function updateData()
 									setTimeout(tick, 1000 * 60);
 								}
 								var finishedQueries = 0;
-								var queryString = "";
+								var allQueries = [];
 								//iterate through the list of untracked games
 								for (var i = 0; i < newgames.length; i++)
 								{
@@ -191,7 +214,7 @@ function updateData()
 										var pts_lose = homeScore > awayScore ? awayScore : homeScore;
 										var homeWin = homeScore > awayScore;
 
-										client.query("SELECT count FROM " + scoresTable + " WHERE (pts_win=" + pts_win + " AND pts_lose=" + pts_lose + ");")
+										dbQuery("SELECT count FROM " + scoresTable + " WHERE (pts_win=" + pts_win + " AND pts_lose=" + pts_lose + ")")
 											.then(res3 =>
 											{
 												//aCompleteFuckingMiracleHasHappened is true when 2 games achieve scorigami with same score at the same time
@@ -232,48 +255,26 @@ function updateData()
 												//if the game score has been achieved before (in database), increment the count and add it to the list of tracked games
 												if(res3.rows[0] || aCompleteFuckingMiracleHasHappened)
 												{
-													queryString += "UPDATE " + scoresTable;
-													queryString += " SET count=count+1";
-													queryString += ", last_date=to_date('" + date + "', 'YYYY-MM-DD')";
-													queryString += ", last_team_win='" + winTeam;
-													queryString += "', last_team_lose='" + loseTeam;
-													queryString += "', last_team_home='" + homeTeam;
-													queryString += "', last_team_away='" + awayTeam;
-													queryString += "', last_link='" + gamelink;
-													queryString += "' WHERE (pts_win=" + pts_win + " AND pts_lose=" + pts_lose + ");\n";
-
-													queryString += "INSERT INTO " + metadataTable + " (description, data_int, data_text) VALUES ('tracked_game', " + game.id + ", 'false');\n";
+													allQueries.push(dbRun("UPDATE " + scoresTable + " SET count=count+1, last_date=?, last_team_win=?, last_team_lose=?, last_team_home=?, last_team_away=?, last_link=? WHERE (pts_win=? AND pts_lose=?)", 
+														[date, winTeam, loseTeam, homeTeam, awayTeam, gamelink, pts_win, pts_lose]));
 													
-													//queryString += "UPDATE " + scoresTable + " SET count=count+1 WHERE (pts_win=" + pts_win + " AND pts_lose=" + pts_lose + ");\n";
+													allQueries.push(dbRun("INSERT INTO " + metadataTable + " (description, data_int, data_text) VALUES ('tracked_game', ?, 'false')", [game.id]));
 												}
 												//if the game score has not been achieved before (not in database), add it to the database and add it to the list of tracked games
 												else
 												{
-													queryString += "INSERT INTO " + scoresTable + " (pts_win, pts_lose, count, first_date, first_team_win, first_team_lose, first_team_home, first_team_away, first_link, last_date, last_team_win, last_team_lose, last_team_home, last_team_away, last_link) ";
-													queryString += "VALUES (" + pts_win;
-													queryString += ", " + pts_lose;
-													queryString += ", 1";
-													queryString += ", to_date('" + date + "', 'YYYY-MM-DD')";
-													queryString += ", '" + winTeam;
-													queryString += "', '" + loseTeam;
-													queryString += "', '" + homeTeam;
-													queryString += "', '" + awayTeam;
-													queryString += "', '" + gamelink;
-													queryString += "', to_date('" + date + "', 'YYYY-MM-DD')";
-													queryString += ", '" + winTeam;
-													queryString += "', '" + loseTeam;
-													queryString += "', '" + homeTeam;
-													queryString += "', '" + awayTeam;
-													queryString += "', '" + gamelink;
-													queryString += "');\n";
-													queryString += "INSERT INTO " + metadataTable + " (description, data_int, data_text) VALUES ('tracked_game', " + game.id + ", 'true');\n";
+													allQueries.push(dbRun("INSERT INTO " + scoresTable + " (pts_win, pts_lose, count, first_date, first_team_win, first_team_lose, first_team_home, first_team_away, first_link, last_date, last_team_win, last_team_lose, last_team_home, last_team_away, last_link) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
+														[pts_win, pts_lose, date, winTeam, loseTeam, homeTeam, awayTeam, gamelink, date, winTeam, loseTeam, homeTeam, awayTeam, gamelink]));
+													
+													allQueries.push(dbRun("INSERT INTO " + metadataTable + " (description, data_int, data_text) VALUES ('tracked_game', ?, 'true')", [game.id]));
 
 													newScorigami.push(game.id);
 												}
 												finishedQueries++;
 												if(finishedQueries >= newgames.length)
 												{
-													client.query(queryString)
+													// Execute all queries
+													Promise.all(allQueries)
 														.then(res4 => 
 														{
 															getData();
@@ -281,6 +282,7 @@ function updateData()
 														.catch(err4 =>
 														{
 															console.log("There was an error updating data: 4");
+															console.log(err4);
 															getData();
 														});
 												}
@@ -326,7 +328,7 @@ function updateData()
 
 function getData()
 {
-	client.query("SELECT * FROM " + scoresTable + ";")
+	dbQuery("SELECT * FROM " + scoresTable)
 		.then(res =>
 		{
 			var newScores = [];
@@ -376,7 +378,7 @@ function getData()
 			throw err;
 		});
 
-	client.query("SELECT * FROM " + metadataTable + ";")
+	dbQuery("SELECT * FROM " + metadataTable)
 		.then(res => 
 		{
 			var newMetadata = [];
@@ -425,13 +427,11 @@ app.get("/wip", function(req, res)
 app.get("/*", function(req, res)
 {
 	res.sendFile(path.join(__dirname+"/../../view/index.html"));
-	client.query("UPDATE " + metadataTable + " SET data_int=data_int+1 WHERE description='hit_counter';" , (err1, res1) =>
-	{
-		if(err1)
+	dbRun("UPDATE " + metadataTable + " SET data_int=data_int+1 WHERE description='hit_counter'")
+		.catch(err1 =>
 		{
 			console.log(err1);
-		}
-	});
+		});
 });
 
 app.listen(process.env.PORT || 8081);

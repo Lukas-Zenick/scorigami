@@ -1,14 +1,29 @@
 "use strict";
 
-const { Client } = require("pg");
+var sqlite3 = require("sqlite3").verbose();
 var request = require("request");
 var dbVars = require("./dbVars");
 
-const client = new Client({
-	connectionString: dbVars.DATABASE_URL,
+const db = new sqlite3.Database(dbVars.DATABASE_PATH, (err) => {
+	if (err) {
+		console.error('Error opening database:', err.message);
+	} else {
+		console.log('Connected to SQLite database for setup');
+	}
 });
 
-client.connect();
+// Helper function to promisify SQLite operations
+function dbRun(sql, params = []) {
+	return new Promise((resolve, reject) => {
+		db.run(sql, params, function(err) {
+			if (err) {
+				reject(err);
+			} else {
+				resolve({ changes: this.changes, lastID: this.lastID });
+			}
+		});
+	});
+}
 
 var numTables = (dbVars.ADD_DEBUG_TABLES ? 4 : 2);
 var numDone = 0;
@@ -17,91 +32,109 @@ request("http://nflscorigami.com/copydb", function(error, response, data)
 {
 	data = JSON.parse(data);
 
-	var queryString = "DROP TABLE IF EXISTS scores;\n";
-	queryString += "CREATE TABLE IF NOT EXISTS scores (";
-	queryString += "pts_win INTEGER, ";
-	queryString += "pts_lose INTEGER, ";
-	queryString += "count INTEGER, ";
-	queryString += "first_date DATE, ";
-	queryString += "first_team_win TEXT, ";
-	queryString += "first_team_lose TEXT, ";
-	queryString += "first_team_home TEXT, ";
-	queryString += "first_team_away TEXT, ";
-	queryString += "first_link TEXT, ";
-	queryString += "last_date DATE, ";
-	queryString += "last_team_win TEXT, ";
-	queryString += "last_team_lose TEXT, ";
-	queryString += "last_team_home TEXT, ";
-	queryString += "last_team_away TEXT, ";
-	queryString += "last_link TEXT";
-	queryString += ")";
-
-	client.query(queryString, (err, res) => 
-	{
-		if(err)
+	// SQLite requires separate statements
+	dbRun("DROP TABLE IF EXISTS scores")
+		.then(() => {
+			return dbRun(`CREATE TABLE IF NOT EXISTS scores (
+				pts_win INTEGER, 
+				pts_lose INTEGER, 
+				count INTEGER, 
+				first_date TEXT, 
+				first_team_win TEXT, 
+				first_team_lose TEXT, 
+				first_team_home TEXT, 
+				first_team_away TEXT, 
+				first_link TEXT, 
+				last_date TEXT, 
+				last_team_win TEXT, 
+				last_team_lose TEXT, 
+				last_team_home TEXT, 
+				last_team_away TEXT, 
+				last_link TEXT
+			)`);
+		})
+		.then(res => 
+		{
+			setupScoresTable(data, false);
+		})
+		.catch(err =>
 		{
 			console.log("error creating scores table");
 			console.log(err);
-		}
-		else
+		});
+
+	// SQLite requires separate statements  
+	dbRun("DROP TABLE IF EXISTS metadata")
+		.then(() => {
+			return dbRun(`CREATE TABLE IF NOT EXISTS metadata (
+				description TEXT, 
+				data_int INTEGER, 
+				data_text TEXT, 
+				data_date TEXT
+			)`);
+		})
+		.then(res => 
 		{
-			setupScoresTable(data, false);
-		}
-	});
-
-	var queryString2 = "DROP TABLE IF EXISTS metadata;\n";
-	queryString2 += "CREATE TABLE IF NOT EXISTS metadata (";
-	queryString2 += "description TEXT, ";
-	queryString2 += "data_int INTEGER, ";
-	queryString2 += "data_text TEXT, ";
-	queryString2 += "data_date DATE";
-	queryString2 += ")";
-
-
-	client.query(queryString2, (err, res) => 
-	{
-		if(err)
+			setupMetadataTable(data, false);
+		})
+		.catch(err =>
 		{
 			console.log("error creating metadata table");
 			console.log(err);
-		}
-		else
-		{
-			setupMetadataTable(data, false);
-		}
-	});
+		});
 
 	if(dbVars.ADD_DEBUG_TABLES)
 	{
-		queryString = queryString.split("scores").join("scores_DEBUG");
-		client.query(queryString, (err, res) => 
-		{
-			if(err)
-			{
-				console.log("error creating scores table");
-				console.log(err);
-				checkDone();
-			}
-			else
+		dbRun("DROP TABLE IF EXISTS scores_DEBUG")
+			.then(() => {
+				return dbRun(`CREATE TABLE IF NOT EXISTS scores_DEBUG (
+					pts_win INTEGER, 
+					pts_lose INTEGER, 
+					count INTEGER, 
+					first_date TEXT, 
+					first_team_win TEXT, 
+					first_team_lose TEXT, 
+					first_team_home TEXT, 
+					first_team_away TEXT, 
+					first_link TEXT, 
+					last_date TEXT, 
+					last_team_win TEXT, 
+					last_team_lose TEXT, 
+					last_team_home TEXT, 
+					last_team_away TEXT, 
+					last_link TEXT
+				)`);
+			})
+			.then(res => 
 			{
 				setupScoresTable(data, true);
-			}
-		});
-
-		queryString2 = queryString2.split("metadata").join("metadata_DEBUG");
-		client.query(queryString2, (err, res) => 
-		{
-			if(err)
+			})
+			.catch(err =>
 			{
-				console.log("error creating metadata table");
+				console.log("error creating scores DEBUG table");
 				console.log(err);
 				checkDone();
-			}
-			else
+			});
+
+		dbRun("DROP TABLE IF EXISTS metadata_DEBUG")
+			.then(() => {
+				return dbRun(`CREATE TABLE IF NOT EXISTS metadata_DEBUG (
+					description TEXT, 
+					data_int INTEGER, 
+					data_text TEXT, 
+					data_date TEXT
+				)`);
+			})
+			.then(res => 
 			{
 				setupMetadataTable(data, true);
-			}
-		});
+			})
+			.catch(err =>
+			{
+				console.log("error creating metadata DEBUG table");
+				console.log(err);
+				checkDone();
+			});
 	}
 });
 
@@ -109,84 +142,82 @@ request("http://nflscorigami.com/copydb", function(error, response, data)
 
 function setupScoresTable(data, isDebugTable)
 {
-	var queryString = "";
+	// Use individual prepared statements for better performance and SQL injection protection
+	var tableName = "scores" + (isDebugTable ? "_DEBUG" : "");
+	var insertQueries = [];
+	
 	for(var i = 0; i < data.scores.length; i++)
 	{
 		var score = data.scores[i];
-
 		var first_date = score.first_date.substr(0, 10);
 		var last_date = score.last_date.substr(0, 10);
 
-		queryString += "INSERT INTO scores"; 
-		queryString += (isDebugTable ? "_DEBUG" : "");
-		queryString += " (pts_win, pts_lose, count, first_date, first_team_win, first_team_lose, first_team_home, first_team_away, first_link, last_date, last_team_win, last_team_lose, last_team_home, last_team_away, last_link) VALUES (";
-		queryString +=  score.pts_win + ", ";
-		queryString +=  score.pts_lose + ", ";
-		queryString +=  score.count + ", ";
-		queryString +=  "TO_DATE('" + first_date + "', 'YYYY-MM-DD'), ";
-		queryString +=  "'" + score.first_team_win + "', ";
-		queryString +=  "'" + score.first_team_lose + "', ";
-		queryString +=  "'" + score.first_team_home + "', ";
-		queryString +=  "'" + score.first_team_away + "', ";
-		queryString +=  "'" + score.first_link + "', ";
-		queryString +=  "TO_DATE('" + last_date + "', 'YYYY-MM-DD'), ";
-		queryString +=  "'" + score.last_team_win + "', ";
-		queryString +=  "'" + score.last_team_lose + "', ";
-		queryString +=  "'" + score.last_team_home + "', ";
-		queryString +=  "'" + score.last_team_away + "', ";
-		queryString +=  "'" + score.last_link + "');\n";
+		var insertSQL = `INSERT INTO ${tableName} (pts_win, pts_lose, count, first_date, first_team_win, first_team_lose, first_team_home, first_team_away, first_link, last_date, last_team_win, last_team_lose, last_team_home, last_team_away, last_link) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+		
+		insertQueries.push(dbRun(insertSQL, [
+			score.pts_win, 
+			score.pts_lose, 
+			score.count, 
+			first_date, 
+			score.first_team_win, 
+			score.first_team_lose, 
+			score.first_team_home, 
+			score.first_team_away, 
+			score.first_link, 
+			last_date, 
+			score.last_team_win, 
+			score.last_team_lose, 
+			score.last_team_home, 
+			score.last_team_away, 
+			score.last_link
+		]));
 	}
 
-	client.query(queryString, (err, res) => {
-		if(err)
-		{
-				console.log("error inserting into scores table");
-				console.log(err);
-		}
-		else
-		{
+	Promise.all(insertQueries)
+		.then(res => {
 			console.log("added scores table" + (isDebugTable ? " (DEBUG)" : ""));
-		}
-		checkDone();
-	});
+			checkDone();
+		})
+		.catch(err => {
+			console.log("error inserting into scores table");
+			console.log(err);
+			checkDone();
+		});
 }
 
 function setupMetadataTable(data, isDebugTable)
 {
-	var queryString = "";
+	var tableName = "metadata" + (isDebugTable ? "_DEBUG" : "");
+	var insertQueries = [];
+	
 	for(var i = 0; i < data.metadata.length; i++)
 	{
 		var metadatum = data.metadata[i];
+		var data_date = (metadatum.data_date === null ? null : metadatum.data_date.substr(0, 10));
 
-		var data_int = (metadatum.data_int === null ? "NULL" : metadatum.data_int);
-		var data_text = (metadatum.data_text === null ? "NULL" :"'" + metadatum.data_text + "'");
-		var data_date = (metadatum.data_date === null ? "NULL" : "TO_DATE('" + metadatum.data_date.substr(0, 10) + "', 'YYYY-MM-DD')");
-
-		queryString += "INSERT INTO metadata";
-		queryString += (isDebugTable ? "_DEBUG" : "");
-		queryString += " (description, data_int, data_text, data_date) VALUES (";
-		queryString += "'" + metadatum.description + "', ";
-		queryString += data_int + ", ";
-		queryString += data_text + ", ";
-		queryString += data_date + ");\n";
+		var insertSQL = `INSERT INTO ${tableName} (description, data_int, data_text, data_date) VALUES (?, ?, ?, ?)`;
+		
+		insertQueries.push(dbRun(insertSQL, [
+			metadatum.description,
+			metadatum.data_int,
+			metadatum.data_text,
+			data_date
+		]));
 	}
 
-	queryString += "INSERT INTO metadata";
-	queryString += (isDebugTable ? "_DEBUG" : "");
-	queryString += " (description, data_int) VALUES ('hit_counter', " + 0 + ");"
+	// Add hit counter
+	insertQueries.push(dbRun(`INSERT INTO ${tableName} (description, data_int) VALUES ('hit_counter', 0)`));
 
-	client.query(queryString, (err, res) => {
-		if(err)
-		{
-				console.log("error inserting into metadata table");
-				console.log(err);
-		}
-		else
-		{
+	Promise.all(insertQueries)
+		.then(res => {
 			console.log("added metadata table" + (isDebugTable ? " (DEBUG)" : ""));
-		}
-		checkDone();
-	});
+			checkDone();
+		})
+		.catch(err => {
+			console.log("error inserting into metadata table");
+			console.log(err);
+			checkDone();
+		});
 }
 
 function checkDone()
@@ -194,6 +225,12 @@ function checkDone()
 	numDone++;
 	if(numDone >= numTables)
 	{
-		client.end();
+		db.close((err) => {
+			if (err) {
+				console.error(err.message);
+			} else {
+				console.log('Database setup complete. Closed SQLite connection.');
+			}
+		});
 	}
 }
